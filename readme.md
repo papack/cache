@@ -1,17 +1,17 @@
 # @papack/cache
 
-Minimal async in-memory cache with built-in in-flight deduplication.
+Minimal async in-memory cache with built-in Promise deduplication.
 
 ## Features
 
 - Async-first
-- Explicit per-call API
-- TTL-based caching
-- In-flight deduplication (stampede protection)
+- Promise-based caching
+- TTL support
+- In-flight deduplication
 - No background timers
-- No metrics
-- No lifecycle/init phase
+- Automatic cleanup of expired entries
 - Errors are never cached
+- Tiny API surface
 
 ## Installation
 
@@ -22,65 +22,79 @@ bun add @papack/cache
 ## Usage
 
 ```ts
-import { cache } from "@papack/cache";
+import { Cache } from "@papack/cache";
 
-const value = await cache(
+const cache = new Cache();
+
+const value = await cache.get(
+  "random",
   async () => {
     return Math.random();
   },
-  {
-    key: "random",
-    ttl: 1000,
-  },
+  1000,
 );
 ```
 
 ## API
 
+### Create Cache
+
 ```ts
-cache(fn, options);
+const cache = new Cache();
+```
+
+---
+
+### `cache.get(key, fn, ttl?)`
+
+```ts
+cache.get<T>(
+  key: string,
+  fn: () => Promise<T>,
+  ttl?: number,
+): Promise<T>;
 ```
 
 ### Parameters
 
-```ts
-{
-  key: string;
-  ttl?: number;
-}
-```
+| parameter | description                    |
+| --------- | ------------------------------ |
+| `key`     | cache key                      |
+| `fn`      | async function                 |
+| `ttl`     | cache duration in milliseconds |
 
-| option | description                    |
-| ------ | ------------------------------ |
-| `key`  | cache key                      |
-| `ttl`  | cache duration in milliseconds |
+### Example
+
+```ts
+const user = await cache.get(
+  `user:${id}`,
+  async () => {
+    const res = await fetch(`/api/users/${id}`);
+
+    if (!res.ok) {
+      throw new Error("failed");
+    }
+
+    return res.json();
+  },
+  30_000,
+);
+```
 
 ## TTL Semantics
 
 ### `ttl > 0`
 
-Normal caching:
+Normal caching.
 
 ```ts
 ttl: 1000;
 ```
 
-- value is cached
-- expires after TTL
-
----
-
-### `ttl: 0`
-
-No caching.
-
 Behavior:
 
-- no cache entry is stored
-- concurrent in-flight calls are still deduplicated
-- once resolved, result is discarded
-
-Useful for request collapsing without persistence.
+- Promise is cached
+- entry expires after TTL
 
 ---
 
@@ -94,8 +108,8 @@ ttl: Infinity;
 
 Behavior:
 
-- value never expires
-- entry remains until process restart
+- entry never expires
+- remains until `clear()` or process restart
 
 Use only with bounded key space.
 
@@ -105,24 +119,13 @@ Concurrent calls with the same key share the same Promise.
 
 ```ts
 const results = await Promise.all([
-  cache(fetchUsers, {
-    key: "users",
-    ttl: 1000,
-  }),
-
-  cache(fetchUsers, {
-    key: "users",
-    ttl: 1000,
-  }),
-
-  cache(fetchUsers, {
-    key: "users",
-    ttl: 1000,
-  }),
+  cache.get("users", fetchUsers, 1000),
+  cache.get("users", fetchUsers, 1000),
+  cache.get("users", fetchUsers, 1000),
 ]);
 ```
 
-Only one `fetchUsers()` runs.
+Only one `fetchUsers()` execution occurs.
 
 All callers receive the same result.
 
@@ -131,75 +134,52 @@ All callers receive the same result.
 Errors are never cached.
 
 ```ts
-await cache(
+await cache.get(
+  "users",
   async () => {
     throw new Error("boom");
   },
-  {
-    key: "users",
-    ttl: 1000,
-  },
+  1000,
 );
 ```
 
 Behavior:
 
-- all concurrent waiters receive the same error
-- no cache entry is stored
+- all concurrent callers receive the same error
+- failed entry is removed automatically
 - next call retries normally
-- in-flight state is cleaned automatically
+
+## Expiration Cleanup
+
+The cache performs lazy cleanup.
+
+Every 1000 requests:
+
+- expired entries are scanned
+- expired keys are removed
+
+No timers or background GC are used.
+
+## Clear Cache
+
+```ts
+cache.clear();
+```
+
+Removes all entries immediately.
 
 ## Cache Keys
 
 The cache operates strictly by key.
 
 ```ts
-key: "users";
+"user:123";
 ```
 
-The library does not normalize arguments or inspect function input.
+The library does not inspect function arguments.
 
-If argument-sensitive caching is needed, include it in the key:
-
-```ts
-key: `user:${id}`;
-```
-
-## Design Constraints
-
-This cache intentionally does not provide:
-
-- distributed storage
-- LRU eviction
-- background GC
-- sliding TTL
-- metrics/stats
-- persistence
-- serialization
-- deep argument comparison
-
-The contract is intentionally small and explicit.
-
-## Example
+If argument-sensitive caching is needed, encode it into the key:
 
 ```ts
-import { cache } from "@papack/cache";
-
-export async function getUser(id: string) {
-  return cache(
-    async () => {
-      const res = await fetch(`https://api.example.com/users/${id}`);
-
-      if (!res.ok) {
-        throw new Error("failed");
-      }
-
-      return res.json();
-    },
-    {
-      key: `user:${id}`,
-      ttl: 30_000,
-    },
-  );
-}
+`user:${id}`;
 ```

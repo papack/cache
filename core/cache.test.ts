@@ -1,516 +1,254 @@
-import { describe, it, expect } from "bun:test";
-import { cache } from "./cache";
+import { describe, expect, test, beforeEach, mock } from "bun:test";
+import { Cache } from "./cache";
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+describe("Cache", () => {
+  let cache: Cache;
 
-const key = (name: string) => `${name}:${crypto.randomUUID()}`;
+  beforeEach(() => {
+    cache = new Cache();
+  });
 
-describe("cache", () => {
-  it("should cache by key", async () => {
-    const k = key("cache-by-key");
-
+  test("returns cached promise for same key", async () => {
     let calls = 0;
 
-    const a = await cache(
-      async () => {
-        calls++;
-        return "ok";
-      },
-      {
-        key: k,
-        ttl: 1000,
-      },
-    );
+    const fn = async () => {
+      calls++;
+      return 123;
+    };
 
-    const b = await cache(
-      async () => {
-        calls++;
-        return "nope";
-      },
-      {
-        key: k,
-        ttl: 1000,
-      },
-    );
+    const [a, b, c] = await Promise.all([
+      cache.get("x", fn),
+      cache.get("x", fn),
+      cache.get("x", fn),
+    ]);
 
-    expect(a).toBe("ok");
-    expect(b).toBe("ok");
+    expect(a).toBe(123);
+    expect(b).toBe(123);
+    expect(c).toBe(123);
+
     expect(calls).toBe(1);
   });
 
-  it("should isolate different keys", async () => {
+  test("creates new request after ttl expires", async () => {
     let calls = 0;
 
-    const a = await cache(
-      async () => {
-        calls++;
-        return "users";
-      },
-      {
-        key: key("users"),
-        ttl: 1000,
-      },
-    );
+    const fn = async () => {
+      calls++;
+      return calls;
+    };
 
-    const b = await cache(
-      async () => {
-        calls++;
-        return "orders";
-      },
-      {
-        key: key("orders"),
-        ttl: 1000,
-      },
-    );
+    const a = await cache.get("x", fn, 10);
 
-    expect(a).toBe("users");
-    expect(b).toBe("orders");
-    expect(calls).toBe(2);
-  });
+    await Bun.sleep(20);
 
-  it("should expire entries via ttl", async () => {
-    const k = key("ttl");
-
-    let calls = 0;
-
-    const a = await cache(
-      async () => {
-        calls++;
-        return calls;
-      },
-      {
-        key: k,
-        ttl: 5,
-      },
-    );
-
-    await sleep(15);
-
-    const b = await cache(
-      async () => {
-        calls++;
-        return calls;
-      },
-      {
-        key: k,
-        ttl: 5,
-      },
-    );
+    const b = await cache.get("x", fn, 10);
 
     expect(a).toBe(1);
     expect(b).toBe(2);
+
     expect(calls).toBe(2);
   });
 
-  it("should support ttl=Infinity", async () => {
-    const k = key("infinity");
-
+  test("keeps cache alive within ttl", async () => {
     let calls = 0;
 
-    const a = await cache(
-      async () => {
-        calls++;
-        return calls;
-      },
-      {
-        key: k,
-        ttl: Infinity,
-      },
-    );
+    const fn = async () => {
+      calls++;
+      return calls;
+    };
 
-    await sleep(10);
-
-    const b = await cache(
-      async () => {
-        calls++;
-        return calls;
-      },
-      {
-        key: k,
-        ttl: Infinity,
-      },
-    );
+    const a = await cache.get("x", fn, 1000);
+    const b = await cache.get("x", fn, 1000);
 
     expect(a).toBe(1);
     expect(b).toBe(1);
+
     expect(calls).toBe(1);
   });
 
-  it("should not cache when ttl=0", async () => {
-    const k = key("no-cache");
-
+  test("removes rejected promises from cache", async () => {
     let calls = 0;
 
-    const a = await cache(
-      async () => {
-        calls++;
-        return calls;
-      },
-      {
-        key: k,
-        ttl: 0,
-      },
-    );
+    const fn = async () => {
+      calls++;
+      throw new Error("boom");
+    };
 
-    const b = await cache(
-      async () => {
-        calls++;
-        return calls;
-      },
-      {
-        key: k,
-        ttl: 0,
-      },
-    );
+    await expect(cache.get("x", fn)).rejects.toThrow("boom");
+    await expect(cache.get("x", fn)).rejects.toThrow("boom");
+
+    expect(calls).toBe(2);
+  });
+
+  test("does not delete newer promise when older one rejects", async () => {
+    let rejectOld!: (err: Error) => void;
+
+    const oldPromise = new Promise<number>((_, reject) => {
+      rejectOld = reject;
+    });
+
+    let newCalls = 0;
+
+    const oldFn = () => oldPromise;
+
+    const newFn = async () => {
+      newCalls++;
+      return 999;
+    };
+
+    const first = cache.get("x", oldFn, 1);
+
+    await Bun.sleep(10);
+
+    const second = cache.get("x", newFn, 1000);
+
+    rejectOld(new Error("old failed"));
+
+    await expect(first).rejects.toThrow("old failed");
+
+    await expect(second).resolves.toBe(999);
+
+    const third = await cache.get("x", newFn, 1000);
+
+    expect(third).toBe(999);
+    expect(newCalls).toBe(1);
+  });
+
+  test("supports Infinity ttl", async () => {
+    let calls = 0;
+
+    const fn = async () => {
+      calls++;
+      return calls;
+    };
+
+    const a = await cache.get("x", fn);
+    await Bun.sleep(20);
+    const b = await cache.get("x", fn);
 
     expect(a).toBe(1);
-    expect(b).toBe(2);
-    expect(calls).toBe(2);
-  });
-
-  it("should deduplicate in-flight calls", async () => {
-    const k = key("dedupe");
-
-    let calls = 0;
-
-    const results = await Promise.all([
-      cache(
-        async () => {
-          calls++;
-          await sleep(10);
-          return "ok";
-        },
-        {
-          key: k,
-          ttl: 1000,
-        },
-      ),
-
-      cache(
-        async () => {
-          calls++;
-          return "nope";
-        },
-        {
-          key: k,
-          ttl: 1000,
-        },
-      ),
-
-      cache(
-        async () => {
-          calls++;
-          return "also-nope";
-        },
-        {
-          key: k,
-          ttl: 1000,
-        },
-      ),
-    ]);
-
-    expect(results).toEqual(["ok", "ok", "ok"]);
-    expect(calls).toBe(1);
-  });
-
-  it("should deduplicate in-flight calls even with ttl=0", async () => {
-    const k = key("dedupe-no-cache");
-
-    let calls = 0;
-
-    const results = await Promise.all([
-      cache(
-        async () => {
-          calls++;
-          await sleep(10);
-          return "ok";
-        },
-        {
-          key: k,
-          ttl: 0,
-        },
-      ),
-
-      cache(
-        async () => {
-          calls++;
-          return "nope";
-        },
-        {
-          key: k,
-          ttl: 0,
-        },
-      ),
-    ]);
-
-    expect(results).toEqual(["ok", "ok"]);
-    expect(calls).toBe(1);
-
-    await cache(
-      async () => {
-        calls++;
-        return "fresh";
-      },
-      {
-        key: k,
-        ttl: 0,
-      },
-    );
-
-    expect(calls).toBe(2);
-  });
-
-  it("should propagate in-flight errors to all waiters", async () => {
-    const k = key("error-fanout");
-
-    let calls = 0;
-
-    const tasks = Promise.all([
-      cache(
-        async () => {
-          calls++;
-          await sleep(10);
-          throw new Error("boom");
-        },
-        {
-          key: k,
-          ttl: 1000,
-        },
-      ),
-
-      cache(
-        async () => {
-          calls++;
-          return "nope";
-        },
-        {
-          key: k,
-          ttl: 1000,
-        },
-      ),
-
-      cache(
-        async () => {
-          calls++;
-          return "also-nope";
-        },
-        {
-          key: k,
-          ttl: 1000,
-        },
-      ),
-    ]);
-
-    await expect(tasks).rejects.toThrow("boom");
+    expect(b).toBe(1);
 
     expect(calls).toBe(1);
   });
 
-  it("should never cache errors", async () => {
-    const k = key("no-error-cache");
-
+  test("clear removes everything", async () => {
     let calls = 0;
 
-    await expect(
-      cache(
-        async () => {
-          calls++;
-          throw new Error(`boom-${calls}`);
-        },
-        {
-          key: k,
-          ttl: 1000,
-        },
-      ),
-    ).rejects.toThrow("boom-1");
+    const fn = async () => {
+      calls++;
+      return calls;
+    };
 
-    await expect(
-      cache(
-        async () => {
-          calls++;
-          throw new Error(`boom-${calls}`);
-        },
-        {
-          key: k,
-          ttl: 1000,
-        },
-      ),
-    ).rejects.toThrow("boom-2");
+    await cache.get("x", fn);
 
+    cache.clear();
+
+    const result = await cache.get("x", fn);
+
+    expect(result).toBe(2);
     expect(calls).toBe(2);
   });
 
-  it("should recover after failure", async () => {
-    const k = key("recover");
-
+  test("handles massive concurrency correctly", async () => {
     let calls = 0;
 
-    await expect(
-      cache(
-        async () => {
-          calls++;
+    const fn = async () => {
+      calls++;
 
-          if (calls === 1) {
-            throw new Error("boom");
-          }
+      await Bun.sleep(10);
 
-          return "ok";
-        },
-        {
-          key: k,
-          ttl: 1000,
-        },
-      ),
-    ).rejects.toThrow("boom");
+      return "ok";
+    };
 
-    const result = await cache(
-      async () => {
-        calls++;
-        return "ok";
-      },
-      {
-        key: k,
-        ttl: 1000,
-      },
+    const results = await Promise.all(
+      Array.from({ length: 10_000 }, () => cache.get("hot-key", fn)),
     );
 
-    expect(result).toBe("ok");
-    expect(calls).toBe(2);
+    expect(new Set(results).size).toBe(1);
+    expect(calls).toBe(1);
   });
 
-  it("should not deadlock after rejection", async () => {
-    const k = key("deadlock");
-
-    let calls = 0;
-
-    await Promise.allSettled([
-      cache(
-        async () => {
-          calls++;
-          await sleep(5);
-          throw new Error("boom");
-        },
-        {
-          key: k,
-          ttl: 1000,
-        },
-      ),
-
-      cache(
-        async () => {
-          calls++;
-          return "x";
-        },
-        {
-          key: k,
-          ttl: 1000,
-        },
-      ),
-    ]);
-
-    const value = await cache(
-      async () => {
-        calls++;
-        return "recovered";
-      },
-      {
-        key: k,
-        ttl: 1000,
-      },
+  test("handles many unique keys", async () => {
+    const results = await Promise.all(
+      Array.from({ length: 5000 }, (_, i) => cache.get(`k${i}`, async () => i)),
     );
 
-    expect(value).toBe("recovered");
-    expect(calls).toBe(2);
-  });
-
-  it("should survive heavy concurrency", async () => {
-    let calls = 0;
-
-    const tasks: Promise<any>[] = [];
-
-    for (let i = 0; i < 1000; i++) {
-      const id = i % 20;
-
-      tasks.push(
-        cache(
-          async () => {
-            calls++;
-
-            await sleep(Math.floor(Math.random() * 5));
-
-            if (id % 10 === 0) {
-              throw new Error("boom");
-            }
-
-            return id;
-          },
-          {
-            key: `stress:${id}`,
-            ttl: 20,
-          },
-        ).catch(() => null),
-      );
-    }
-
-    const results = await Promise.all(tasks);
+    expect(results).toHaveLength(5000);
 
     for (let i = 0; i < results.length; i++) {
-      const id = i % 20;
-
-      if (id % 10 === 0) {
-        expect(results[i]).toBeNull();
-      } else {
-        expect(results[i]).toBe(id);
-      }
+      expect(results[i]).toBe(i);
     }
-
-    // must be massively below 1000 if dedupe works
-    expect(calls).toBeLessThan(300);
   });
 
-  it("should refresh after ttl expiry under concurrency", async () => {
-    const k = key("refresh");
+  test("cleanup removes expired entries", async () => {
+    const fn = async () => 1;
 
-    let value = 0;
+    await cache.get("a", fn, 1);
+    await cache.get("b", fn, 1);
 
-    const first = await cache(
-      async () => {
-        await sleep(2);
-        return ++value;
-      },
-      {
-        key: k,
-        ttl: 5,
-      },
-    );
+    await Bun.sleep(10);
 
-    await sleep(15);
+    // trigger cleanup cycle
+    for (let i = 0; i < 1000; i++) {
+      await cache.get(`x${i}`, async () => i, 1);
+    }
 
-    const results = await Promise.all([
-      cache(
-        async () => {
-          await sleep(2);
-          return ++value;
-        },
-        {
-          key: k,
-          ttl: 5,
-        },
-      ),
+    const store = (cache as any).store as Map<string, unknown>;
 
-      cache(async () => 999, {
-        key: k,
-        ttl: 5,
-      }),
+    expect(store.has("a")).toBe(false);
+    expect(store.has("b")).toBe(false);
+  });
 
-      cache(async () => 999, {
-        key: k,
-        ttl: 5,
-      }),
+  test("survives repeated rapid expiration churn", async () => {
+    let calls = 0;
+
+    const fn = async () => {
+      calls++;
+      return calls;
+    };
+
+    for (let i = 0; i < 500; i++) {
+      await cache.get("x", fn, 1);
+      await Bun.sleep(2);
+    }
+
+    expect(calls).toBeGreaterThan(100);
+  });
+
+  test("sync throw is converted into rejected promise", async () => {
+    const fn = () => {
+      throw new Error("sync");
+    };
+
+    await expect(cache.get("x", fn)).rejects.toThrow("sync");
+  });
+
+  test("parallel expired requests collapse correctly", async () => {
+    let calls = 0;
+
+    const fn = async () => {
+      calls++;
+
+      await Bun.sleep(5);
+
+      return calls;
+    };
+
+    await cache.get("x", fn, 1);
+
+    await Bun.sleep(10);
+
+    const [a, b, c] = await Promise.all([
+      cache.get("x", fn, 100),
+      cache.get("x", fn, 100),
+      cache.get("x", fn, 100),
     ]);
 
-    expect(results[0]).toBeGreaterThan(first);
-    expect(results[1]).toBe(results[0]);
-    expect(results[2]).toBe(results[0]);
+    expect(a).toBe(2);
+    expect(b).toBe(2);
+    expect(c).toBe(2);
+
+    expect(calls).toBe(2);
   });
 });

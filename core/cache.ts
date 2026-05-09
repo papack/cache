@@ -1,79 +1,48 @@
-type CacheOptions = {
-  key: string;
-  ttl?: number;
-};
-
 type Entry<T> = {
-  value: T;
+  promise: Promise<T>;
   expiresAt: number;
 };
 
-const store = new Map<string, Entry<any>>();
-const inflight = new Map<string, Promise<any>>();
+export class Cache {
+  private store = new Map<string, Entry<unknown>>();
+  private requests = 0;
 
-export async function cache<T>(
-  fn: () => Promise<T> | T,
-  options: CacheOptions,
-): Promise<T> {
-  const { key, ttl = Infinity } = options;
+  get<T>(key: string, fn: () => Promise<T>, ttl = Infinity): Promise<T> {
+    const now = Date.now();
 
-  // kein cache -> nur inflight dedupe
-  if (ttl === 0) {
-    const running = inflight.get(key);
-
-    if (running) {
-      return running;
+    if (++this.requests % 1000 === 0) {
+      for (const [k, v] of this.store) {
+        if (v.expiresAt <= now) {
+          this.store.delete(k);
+        }
+      }
     }
 
-    const promise = (async () => {
-      try {
-        return await fn();
-      } finally {
-        inflight.delete(key);
-      }
-    })();
+    const existing = this.store.get(key);
 
-    inflight.set(key, promise);
+    if (existing && existing.expiresAt > now) {
+      return existing.promise as Promise<T>;
+    }
+
+    const promise = Promise.resolve()
+      .then(fn)
+      .catch((err) => {
+        if (this.store.get(key)?.promise === promise) {
+          this.store.delete(key);
+        }
+
+        throw err;
+      });
+
+    this.store.set(key, {
+      promise,
+      expiresAt: now + ttl,
+    });
 
     return promise;
   }
 
-  const now = Date.now();
-
-  // cache hit
-  const existing = store.get(key);
-
-  if (existing && existing.expiresAt > now) {
-    return existing.value;
+  clear() {
+    this.store.clear();
   }
-
-  if (existing) {
-    store.delete(key);
-  }
-
-  // inflight dedupe
-  const running = inflight.get(key);
-
-  if (running) {
-    return running;
-  }
-
-  const promise = (async () => {
-    try {
-      const value = await fn();
-
-      store.set(key, {
-        value,
-        expiresAt: ttl === Infinity ? Infinity : now + ttl,
-      });
-
-      return value;
-    } finally {
-      inflight.delete(key);
-    }
-  })();
-
-  inflight.set(key, promise);
-
-  return promise;
 }
