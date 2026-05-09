@@ -1,250 +1,462 @@
 import { describe, it, expect } from "bun:test";
-import { createCache } from "./cache";
+import { cache } from "./cache";
 
-type Keys = "users" | "orders";
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-describe("cache contract", () => {
-  it("should enforce init-before-call at runtime", async () => {
-    const cache = createCache<Keys>();
+const key = (name: string) => `${name}:${crypto.randomUUID()}`;
 
-    await expect(cache("users").call({ any: true })).rejects.toThrow(
-      /not initialized/i,
-    );
-  });
+describe("cache", () => {
+  it("should cache by key", async () => {
+    const k = key("cache-by-key");
 
-  it("should register exactly once per key", () => {
-    const cache = createCache<Keys>();
-
-    cache("users").init({
-      ttl: 1000,
-      fn: async () => "ok",
-      onHit: () => {},
-      onMiss: () => {},
-      onError: () => {},
-    });
-
-    expect(() =>
-      cache("users").init({
-        ttl: 1000,
-        fn: async () => "nope",
-        onHit: () => {},
-        onMiss: () => {},
-        onError: () => {},
-      }),
-    ).toThrow(/already initialized/i);
-  });
-
-  it("should cache per normalized args", async () => {
-    const cache = createCache<Keys>();
     let calls = 0;
 
-    cache("users").init({
-      ttl: 1000,
-      fn: async (args: { id: number }) => {
+    const a = await cache(
+      async () => {
         calls++;
-        return args.id;
-      },
-      onHit: () => {},
-      onMiss: () => {},
-      onError: () => {},
-    });
-
-    const a = await cache("users").call({ id: 1 });
-    const b = await cache("users").call({ id: 1 });
-    const c = await cache("users").call({ id: 2 });
-
-    expect(a).toBe(1);
-    expect(b).toBe(1);
-    expect(c).toBe(2);
-    expect(calls).toBe(2); // id=1 once, id=2 once
-  });
-
-  it("should invalidate logically", async () => {
-    const cache = createCache<Keys>();
-    let calls = 0;
-
-    cache("users").init({
-      ttl: 1000,
-      fn: async () => ++calls,
-      onHit: () => {},
-      onMiss: () => {},
-      onError: () => {},
-    });
-
-    const a = await cache("users").call({});
-    cache("users").invalidate();
-    const b = await cache("users").call({});
-
-    expect(a).toBe(1);
-    expect(b).toBe(2);
-  });
-
-  it("should recover after async error and allow new calls", async () => {
-    const cache = createCache<Keys>();
-    let calls = 0;
-
-    cache("users").init({
-      ttl: 1000,
-      fn: async () => {
-        calls++;
-        if (calls === 1) throw new Error("boom");
         return "ok";
       },
-      onHit: () => {},
-      onMiss: () => {},
-      onError: () => {},
-    });
+      {
+        key: k,
+        ttl: 1000,
+      },
+    );
 
-    await expect(cache("users").call({})).rejects.toThrow("boom");
+    const b = await cache(
+      async () => {
+        calls++;
+        return "nope";
+      },
+      {
+        key: k,
+        ttl: 1000,
+      },
+    );
 
-    const result = await cache("users").call({});
-    expect(result).toBe("ok");
+    expect(a).toBe("ok");
+    expect(b).toBe("ok");
+    expect(calls).toBe(1);
+  });
+
+  it("should isolate different keys", async () => {
+    let calls = 0;
+
+    const a = await cache(
+      async () => {
+        calls++;
+        return "users";
+      },
+      {
+        key: key("users"),
+        ttl: 1000,
+      },
+    );
+
+    const b = await cache(
+      async () => {
+        calls++;
+        return "orders";
+      },
+      {
+        key: key("orders"),
+        ttl: 1000,
+      },
+    );
+
+    expect(a).toBe("users");
+    expect(b).toBe("orders");
     expect(calls).toBe(2);
   });
 
-  it("should expire entries via ttl + gc", async () => {
-    const cache = createCache<Keys>();
+  it("should expire entries via ttl", async () => {
+    const k = key("ttl");
 
-    cache("users").init({
-      ttl: 1,
-      fn: async () => "x",
-      onHit: () => {},
-      onMiss: () => {},
-      onError: () => {},
-    });
-
-    await cache("users").call({});
-    await new Promise((r) => setTimeout(r, 5));
-
-    cache.gc("users");
-    const stats = cache.stats("users");
-
-    expect(stats.entries).toBe(0);
-  });
-
-  it("should deduplicate in-flight calls (stampede protection)", async () => {
-    const cache = createCache<Keys>();
     let calls = 0;
 
-    cache("users").init({
-      ttl: 1000,
-      fn: async () => {
+    const a = await cache(
+      async () => {
         calls++;
-        await new Promise((r) => setTimeout(r, 10));
-        return "ok";
+        return calls;
       },
-      onHit: () => {},
-      onMiss: () => {},
-      onError: () => {},
-    });
+      {
+        key: k,
+        ttl: 5,
+      },
+    );
+
+    await sleep(15);
+
+    const b = await cache(
+      async () => {
+        calls++;
+        return calls;
+      },
+      {
+        key: k,
+        ttl: 5,
+      },
+    );
+
+    expect(a).toBe(1);
+    expect(b).toBe(2);
+    expect(calls).toBe(2);
+  });
+
+  it("should support ttl=Infinity", async () => {
+    const k = key("infinity");
+
+    let calls = 0;
+
+    const a = await cache(
+      async () => {
+        calls++;
+        return calls;
+      },
+      {
+        key: k,
+        ttl: Infinity,
+      },
+    );
+
+    await sleep(10);
+
+    const b = await cache(
+      async () => {
+        calls++;
+        return calls;
+      },
+      {
+        key: k,
+        ttl: Infinity,
+      },
+    );
+
+    expect(a).toBe(1);
+    expect(b).toBe(1);
+    expect(calls).toBe(1);
+  });
+
+  it("should not cache when ttl=0", async () => {
+    const k = key("no-cache");
+
+    let calls = 0;
+
+    const a = await cache(
+      async () => {
+        calls++;
+        return calls;
+      },
+      {
+        key: k,
+        ttl: 0,
+      },
+    );
+
+    const b = await cache(
+      async () => {
+        calls++;
+        return calls;
+      },
+      {
+        key: k,
+        ttl: 0,
+      },
+    );
+
+    expect(a).toBe(1);
+    expect(b).toBe(2);
+    expect(calls).toBe(2);
+  });
+
+  it("should deduplicate in-flight calls", async () => {
+    const k = key("dedupe");
+
+    let calls = 0;
 
     const results = await Promise.all([
-      cache("users").call({}),
-      cache("users").call({}),
-      cache("users").call({}),
+      cache(
+        async () => {
+          calls++;
+          await sleep(10);
+          return "ok";
+        },
+        {
+          key: k,
+          ttl: 1000,
+        },
+      ),
+
+      cache(
+        async () => {
+          calls++;
+          return "nope";
+        },
+        {
+          key: k,
+          ttl: 1000,
+        },
+      ),
+
+      cache(
+        async () => {
+          calls++;
+          return "also-nope";
+        },
+        {
+          key: k,
+          ttl: 1000,
+        },
+      ),
     ]);
 
     expect(results).toEqual(["ok", "ok", "ok"]);
     expect(calls).toBe(1);
   });
 
-  it("should invalidate and propagate error on failure", async () => {
-    const cache = createCache<Keys>();
-    let errors = 0;
-
-    cache("users").init({
-      ttl: 1000,
-      fn: async () => {
-        throw new Error("boom");
-      },
-      onHit: () => {},
-      onMiss: () => {},
-      onError: () => {
-        errors++;
-      },
-    });
-
-    const calls = Promise.all([
-      cache("users").call({}),
-      cache("users").call({}),
-    ]);
-
-    await expect(calls).rejects.toThrow("boom");
-
-    const stats = cache.stats("users");
-    expect(stats.entries).toBe(0);
-    expect(errors).toBe(1);
-  });
-
-  it("should expose correct stats", async () => {
-    const cache = createCache<Keys>();
-
-    cache("users").init({
-      ttl: 1000,
-      fn: async () => "x",
-      onHit: () => {},
-      onMiss: () => {},
-      onError: () => {},
-    });
-
-    await cache("users").call({});
-    await cache("users").call({});
-
-    const stats = cache.stats("users");
-
-    expect(stats.hits).toBe(1);
-    expect(stats.misses).toBe(1);
-    expect(stats.errors).toBe(0);
-    expect(stats.entries).toBe(1);
-    expect(stats.inFlight).toBe(0);
-  });
-});
-
-describe("cache stress / edge cases", () => {
-  it("should remain consistent under heavy concurrent load", async () => {
-    const cache = createCache<Keys>();
+  it("should deduplicate in-flight calls even with ttl=0", async () => {
+    const k = key("dedupe-no-cache");
 
     let calls = 0;
-    let errors = 0;
 
-    cache("users").init({
-      ttl: 20,
-      fn: async ({ id }: { id: number }) => {
+    const results = await Promise.all([
+      cache(
+        async () => {
+          calls++;
+          await sleep(10);
+          return "ok";
+        },
+        {
+          key: k,
+          ttl: 0,
+        },
+      ),
+
+      cache(
+        async () => {
+          calls++;
+          return "nope";
+        },
+        {
+          key: k,
+          ttl: 0,
+        },
+      ),
+    ]);
+
+    expect(results).toEqual(["ok", "ok"]);
+    expect(calls).toBe(1);
+
+    await cache(
+      async () => {
         calls++;
-
-        // introduce jitter + occasional failure
-        await new Promise((r) => setTimeout(r, Math.floor(Math.random() * 5)));
-
-        if (id % 10 === 0) {
-          throw new Error("random failure");
-        }
-
-        return id;
+        return "fresh";
       },
-      onHit: () => {},
-      onMiss: () => {},
-      onError: () => {
-        errors++;
+      {
+        key: k,
+        ttl: 0,
       },
-    });
+    );
+
+    expect(calls).toBe(2);
+  });
+
+  it("should propagate in-flight errors to all waiters", async () => {
+    const k = key("error-fanout");
+
+    let calls = 0;
+
+    const tasks = Promise.all([
+      cache(
+        async () => {
+          calls++;
+          await sleep(10);
+          throw new Error("boom");
+        },
+        {
+          key: k,
+          ttl: 1000,
+        },
+      ),
+
+      cache(
+        async () => {
+          calls++;
+          return "nope";
+        },
+        {
+          key: k,
+          ttl: 1000,
+        },
+      ),
+
+      cache(
+        async () => {
+          calls++;
+          return "also-nope";
+        },
+        {
+          key: k,
+          ttl: 1000,
+        },
+      ),
+    ]);
+
+    await expect(tasks).rejects.toThrow("boom");
+
+    expect(calls).toBe(1);
+  });
+
+  it("should never cache errors", async () => {
+    const k = key("no-error-cache");
+
+    let calls = 0;
+
+    await expect(
+      cache(
+        async () => {
+          calls++;
+          throw new Error(`boom-${calls}`);
+        },
+        {
+          key: k,
+          ttl: 1000,
+        },
+      ),
+    ).rejects.toThrow("boom-1");
+
+    await expect(
+      cache(
+        async () => {
+          calls++;
+          throw new Error(`boom-${calls}`);
+        },
+        {
+          key: k,
+          ttl: 1000,
+        },
+      ),
+    ).rejects.toThrow("boom-2");
+
+    expect(calls).toBe(2);
+  });
+
+  it("should recover after failure", async () => {
+    const k = key("recover");
+
+    let calls = 0;
+
+    await expect(
+      cache(
+        async () => {
+          calls++;
+
+          if (calls === 1) {
+            throw new Error("boom");
+          }
+
+          return "ok";
+        },
+        {
+          key: k,
+          ttl: 1000,
+        },
+      ),
+    ).rejects.toThrow("boom");
+
+    const result = await cache(
+      async () => {
+        calls++;
+        return "ok";
+      },
+      {
+        key: k,
+        ttl: 1000,
+      },
+    );
+
+    expect(result).toBe("ok");
+    expect(calls).toBe(2);
+  });
+
+  it("should not deadlock after rejection", async () => {
+    const k = key("deadlock");
+
+    let calls = 0;
+
+    await Promise.allSettled([
+      cache(
+        async () => {
+          calls++;
+          await sleep(5);
+          throw new Error("boom");
+        },
+        {
+          key: k,
+          ttl: 1000,
+        },
+      ),
+
+      cache(
+        async () => {
+          calls++;
+          return "x";
+        },
+        {
+          key: k,
+          ttl: 1000,
+        },
+      ),
+    ]);
+
+    const value = await cache(
+      async () => {
+        calls++;
+        return "recovered";
+      },
+      {
+        key: k,
+        ttl: 1000,
+      },
+    );
+
+    expect(value).toBe("recovered");
+    expect(calls).toBe(2);
+  });
+
+  it("should survive heavy concurrency", async () => {
+    let calls = 0;
 
     const tasks: Promise<any>[] = [];
 
-    // 1000 concurrent calls, overlapping args, mixed failures
     for (let i = 0; i < 1000; i++) {
-      const id = i % 20; // force collisions
+      const id = i % 20;
+
       tasks.push(
-        cache("users")
-          .call({ id })
-          .catch(() => null),
+        cache(
+          async () => {
+            calls++;
+
+            await sleep(Math.floor(Math.random() * 5));
+
+            if (id % 10 === 0) {
+              throw new Error("boom");
+            }
+
+            return id;
+          },
+          {
+            key: `stress:${id}`,
+            ttl: 20,
+          },
+        ).catch(() => null),
       );
     }
 
     const results = await Promise.all(tasks);
 
-    // All non-failing ids should resolve correctly
     for (let i = 0; i < results.length; i++) {
       const id = i % 20;
+
       if (id % 10 === 0) {
         expect(results[i]).toBeNull();
       } else {
@@ -252,111 +464,53 @@ describe("cache stress / edge cases", () => {
       }
     }
 
-    const stats = cache.stats("users");
-
-    // Hard invariants
-    expect(stats.inFlight).toBe(0); // no leaked promises
-    expect(stats.entries).toBeLessThanOrEqual(20);
-    expect(stats.errors).toBe(errors);
-
-    // Calls should be bounded (stampede protection works)
-    expect(calls).toBeLessThan(300); // << 1000
+    // must be massively below 1000 if dedupe works
+    expect(calls).toBeLessThan(300);
   });
 
-  it("should not return stale data after ttl under concurrency", async () => {
-    const cache = createCache<Keys>();
+  it("should refresh after ttl expiry under concurrency", async () => {
+    const k = key("refresh");
+
     let value = 0;
 
-    cache("users").init({
-      ttl: 10,
-      fn: async () => {
-        await new Promise((r) => setTimeout(r, 2));
+    const first = await cache(
+      async () => {
+        await sleep(2);
         return ++value;
       },
-      onHit: () => {},
-      onMiss: () => {},
-      onError: () => {},
-    });
+      {
+        key: k,
+        ttl: 5,
+      },
+    );
 
-    const first = (await cache("users").call({})) as number;
-    await new Promise((r) => setTimeout(r, 15));
+    await sleep(15);
 
     const results = await Promise.all([
-      cache("users").call({}),
-      cache("users").call({}),
-      cache("users").call({}),
+      cache(
+        async () => {
+          await sleep(2);
+          return ++value;
+        },
+        {
+          key: k,
+          ttl: 5,
+        },
+      ),
+
+      cache(async () => 999, {
+        key: k,
+        ttl: 5,
+      }),
+
+      cache(async () => 999, {
+        key: k,
+        ttl: 5,
+      }),
     ]);
 
-    // all should see the same fresh value
     expect(results[0]).toBeGreaterThan(first);
     expect(results[1]).toBe(results[0]);
     expect(results[2]).toBe(results[0]);
-  });
-
-  it("should not deadlock if invalidate is called during in-flight", async () => {
-    const cache = createCache<Keys>();
-    let calls = 0;
-
-    let release: () => void;
-    const gate = new Promise<void>((r) => (release = r));
-
-    cache("users").init({
-      ttl: 1000,
-      fn: async () => {
-        calls++;
-        await gate;
-        return "ok";
-      },
-      onHit: () => {},
-      onMiss: () => {},
-      onError: () => {},
-    });
-
-    const p1 = cache("users").call({});
-    const p2 = cache("users").call({});
-
-    cache("users").invalidate(); // invalidate while in-flight
-    release!();
-
-    const results = await Promise.all([p1, p2]);
-
-    expect(results).toEqual(["ok", "ok"]);
-    expect(calls).toBe(1);
-
-    const stats = cache.stats("users");
-    expect(stats.inFlight).toBe(0);
-  });
-  it("should count hits and misses correctly under in-flight concurrency", async () => {
-    const cache = createCache<Keys>();
-
-    cache("users").init({
-      ttl: 1000,
-      fn: async () => {
-        await new Promise((r) => setTimeout(r, 10));
-        return "ok";
-      },
-      onHit: () => {},
-      onMiss: () => {},
-      onError: () => {},
-    });
-
-    await Promise.all([
-      cache("users").call({}),
-      cache("users").call({}),
-      cache("users").call({}),
-    ]);
-
-    const afterFirstWave = cache.stats("users");
-
-    expect(afterFirstWave.misses).toBe(1);
-    expect(afterFirstWave.hits).toBe(0);
-
-    await cache("users").call({});
-    await cache("users").call({});
-
-    const afterHits = cache.stats("users");
-
-    expect(afterHits.misses).toBe(1);
-    expect(afterHits.hits).toBe(2);
   });
 });

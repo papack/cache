@@ -1,144 +1,79 @@
-import type { CachePortInterface } from "./cache-port-interface";
-
-type Entry<TArgs, TResult> = {
-  fn: (args: TArgs) => Promise<TResult>;
-  ttl: number;
-  onHit?: () => void;
-  onMiss?: () => void;
-  onError: (err: unknown) => void;
-
-  values: Map<string, { value: TResult; expires: number }>;
-  inFlight: Map<string, Promise<TResult>>;
-
-  stats: {
-    hits: number;
-    misses: number;
-    errors: number;
-  };
+type CacheOptions = {
+  key: string;
+  ttl?: number;
 };
 
-function normalizeArgs(args: unknown): string {
-  return JSON.stringify(args);
-}
+type Entry<T> = {
+  value: T;
+  expiresAt: number;
+};
 
-export function createCache<TKey extends string>(): CachePortInterface<TKey> {
-  const entries = new Map<TKey, Entry<any, any>>();
+const store = new Map<string, Entry<any>>();
+const inflight = new Map<string, Promise<any>>();
 
-  function getEntry<K extends TKey>(key: K): Entry<any, any> {
-    const entry = entries.get(key);
-    if (!entry) {
-      throw new Error(`Cache key not initialized: ${String(key)}`);
+export async function cache<T>(
+  fn: () => Promise<T> | T,
+  options: CacheOptions,
+): Promise<T> {
+  const { key, ttl = Infinity } = options;
+
+  // kein cache -> nur inflight dedupe
+  if (ttl === 0) {
+    const running = inflight.get(key);
+
+    if (running) {
+      return running;
     }
-    return entry;
+
+    const promise = (async () => {
+      try {
+        return await fn();
+      } finally {
+        inflight.delete(key);
+      }
+    })();
+
+    inflight.set(key, promise);
+
+    return promise;
   }
 
-  const cache = (<K extends TKey>(key: K) => {
-    return {
-      init(config: {
-        fn: (args: any) => Promise<any>;
-        ttl: number;
-        onError: (err: unknown) => void;
-        onHit?: () => void;
-        onMiss?: () => void;
-      }) {
-        if (entries.has(key)) {
-          throw new Error(`Cache key already initialized: ${String(key)}`);
-        }
+  const now = Date.now();
 
-        entries.set(key, {
-          fn: config.fn,
-          ttl: config.ttl,
-          onHit: config.onHit,
-          onMiss: config.onMiss,
-          onError: config.onError,
+  // cache hit
+  const existing = store.get(key);
 
-          values: new Map(),
-          inFlight: new Map(),
+  if (existing && existing.expiresAt > now) {
+    return existing.value;
+  }
 
-          stats: {
-            hits: 0,
-            misses: 0,
-            errors: 0,
-          },
-        });
-      },
+  if (existing) {
+    store.delete(key);
+  }
 
-      async call(args: any) {
-        const entry = getEntry(key);
-        const now = Date.now();
-        const argKey = normalizeArgs(args);
+  // inflight dedupe
+  const running = inflight.get(key);
 
-        const cached = entry.values.get(argKey);
-        if (cached && cached.expires > now) {
-          entry.stats.hits++;
-          entry.onHit?.();
-          return cached.value;
-        }
+  if (running) {
+    return running;
+  }
 
-        if (entry.inFlight.has(argKey)) {
-          return entry.inFlight.get(argKey)!;
-        }
+  const promise = (async () => {
+    try {
+      const value = await fn();
 
-        entry.stats.misses++;
-        entry.onMiss?.();
+      store.set(key, {
+        value,
+        expiresAt: ttl === Infinity ? Infinity : now + ttl,
+      });
 
-        const promise = entry
-          .fn(args)
-          .then((result) => {
-            entry.values.set(argKey, {
-              value: result,
-              expires: now + entry.ttl,
-            });
-            return result;
-          })
-          .catch((err) => {
-            entry.stats.errors++;
-            entry.onError(err);
-            entry.values.clear(); // logical invalidate on error
-            throw err;
-          })
-          .finally(() => {
-            entry.inFlight.delete(argKey);
-          });
-
-        entry.inFlight.set(argKey, promise);
-        return promise;
-      },
-
-      invalidate() {
-        const entry = getEntry(key);
-        entry.values.clear();
-        entry.inFlight.clear();
-      },
-    };
-  }) as CachePortInterface<TKey>;
-
-  cache.stats = (key) => {
-    const entry = getEntry(key);
-    return {
-      hits: entry.stats.hits,
-      misses: entry.stats.misses,
-      errors: entry.stats.errors,
-      entries: entry.values.size,
-      inFlight: entry.inFlight.size,
-    };
-  };
-
-  cache.gc = (key?) => {
-    const now = Date.now();
-    const keys = key ? [key] : Array.from(entries.keys());
-
-    for (const k of keys) {
-      const entry = entries.get(k);
-      if (!entry) continue;
-
-      for (const [argKey, value] of entry.values) {
-        if (value.expires <= now) {
-          entry.values.delete(argKey);
-        }
-      }
+      return value;
+    } finally {
+      inflight.delete(key);
     }
-  };
+  })();
 
-  return cache;
+  inflight.set(key, promise);
+
+  return promise;
 }

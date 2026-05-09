@@ -1,20 +1,17 @@
 # @papack/cache
 
-Minimal, explicit in-memory cache.
+Minimal async in-memory cache with built-in in-flight deduplication.
 
-Designed for **small–medium services** where correctness, predictability, and explicit control matter more than abstraction.
+## Features
 
-## Core Idea
-
-- Typed cache keys (compile-time enforced at call sites)
-- Explicit initialization per key
-- Async-first, in-memory
-- Deterministic, absolute TTL
-- Built-in cache-stampede protection
-- No background work
-- No hidden behavior
-
-It is a **strict cache** with a small, well-defined contract.
+- Async-first
+- Explicit per-call API
+- TTL-based caching
+- In-flight deduplication (stampede protection)
+- No background timers
+- No metrics
+- No lifecycle/init phase
+- Errors are never cached
 
 ## Installation
 
@@ -22,232 +19,187 @@ It is a **strict cache** with a small, well-defined contract.
 bun add @papack/cache
 ```
 
-## Instantiation
-
-Keys are bound **once** at creation time and enforced everywhere.
+## Usage
 
 ```ts
-type CacheKeys = "users" | "orders";
+import { cache } from "@papack/cache";
 
-export const cache = createCache<CacheKeys>();
+const value = await cache(
+  async () => {
+    return Math.random();
+  },
+  {
+    key: "random",
+    ttl: 1000,
+  },
+);
 ```
 
-- Only keys from `CacheKeys` are allowed at compile time
-- Key typos are compile-time errors
-- Using a key before initialization throws at runtime
-
-## Initialization (Required)
-
-Each key must be initialized **exactly once**.
+## API
 
 ```ts
-cache("users").init({
-  fn: fetchUsers,
-  ttl: 30_000,
-  onHit: () => {},
-  onMiss: () => {},
-  onError: () => {},
-});
+cache(fn, options);
 ```
 
-Rules:
-
-- `init` defines the function and TTL for the key
-- Calling `init` twice throws
-- Calling `call` before `init` throws
-- `onError` is mandatory
-
-## Read (Cache-Through)
+### Parameters
 
 ```ts
-const users = await cache("users").call({ active: true });
+{
+  key: string;
+  ttl?: number;
+}
+```
+
+| option | description                    |
+| ------ | ------------------------------ |
+| `key`  | cache key                      |
+| `ttl`  | cache duration in milliseconds |
+
+## TTL Semantics
+
+### `ttl > 0`
+
+Normal caching:
+
+```ts
+ttl: 1000;
+```
+
+- value is cached
+- expires after TTL
+
+---
+
+### `ttl: 0`
+
+No caching.
+
+Behavior:
+
+- no cache entry is stored
+- concurrent in-flight calls are still deduplicated
+- once resolved, result is discarded
+
+Useful for request collapsing without persistence.
+
+---
+
+### `ttl: Infinity`
+
+Permanent cache entry.
+
+```ts
+ttl: Infinity;
 ```
 
 Behavior:
 
-- First call → miss → `fn` runs
-- Result is cached per `(key + normalized args)`
-- Subsequent calls within TTL → hit
-- Different args → different cache entries
-
-## In-Flight Deduplication (Stampede Protection)
-
-For each `(key + normalized args)`:
-
-- Only **one** `fn` runs at a time
-- Concurrent callers await the same Promise
-
-On success:
-
-- Result is cached once
-- TTL starts after `fn` resolves
-- All waiting callers receive the same result
-
-On error:
-
-- Nothing is cached
-- All waiting callers receive the same error
-- `onError` is called exactly once
-- Existing cache entries for the key are invalidated
-
-## Write / Invalidate
-
-```ts
-cache("users").invalidate();
-```
-
-- Clears all cached entries for the key
-- Clears in-flight state
-- Does **not** remove the key definition
-
-Invalidate is **logical**, not destructive.
-
-## TTL & Garbage Collection
-
-TTL is enforced per entry and is **absolute**, not sliding.
-
-```ts
-cache.gc(); // all keys
-cache.gc("users"); // single key
-```
-
-- TTL starts once after a successful `fn` call
-- Hits do not extend TTL
-- Expired entries are ignored on access
-- Expired entries are removed only when `gc()` is called
-- No background timers
-
-## Stats
-
-```ts
-const stats = cache.stats("users");
-```
-
-Returned metrics:
-
-```ts
-{
-  hits: number;
-  misses: number;
-  errors: number;
-  entries: number;
-  inFlight: number;
-}
-```
-
-Stats are best-effort monitoring, not accounting.
-
-## Error Semantics
-
-- Errors are never cached
-- Errors invalidate existing entries for the key
-- Errors propagate to all concurrent callers
-- Cache remains usable after failure
-
-## FAQ
-
-### Does the cache store one value per key or per call?
-
-Per **key + normalized arguments**.
-
-Each cache key can hold multiple entries:
-
-```
-(key + args) → result
-```
-
-Different arguments always create separate cache entries.
-
-### How are arguments normalized?
-
-Arguments are normalized using:
-
-```ts
-JSON.stringify(args);
-```
-
-The resulting string is used as the lookup key.
-
-- Same string → same cache entry
-- Different string → different entry
-- Object key order matters
-- No deep or semantic equality
-- Non-serializable values are not supported
-
-### What happens if object keys are in a different order?
-
-They are treated as **different arguments**.
-
-```ts
-{ a: 1, b: 2 } !== { b: 2, a: 1 }
-```
-
-This is intentional. The cache compares strings, not meaning.
-
-### How does TTL work?
-
-TTL is absolute.
-
-After a successful call to `fn`:
-
-```
-expires = Date.now() + ttl
-```
-
-- TTL starts once
-- Hits do not extend TTL
-- In-flight waiters do not affect TTL
-
-### Why no sliding TTL?
-
-By design.
-
-- Sliding TTL hides behavior
-- Hot keys may never expire
-- Harder to reason about
-
-Fixed TTL is deterministic and predictable.
-
-### When is cache data removed?
-
-In two ways:
-
-1. **Logically**
-   Expired entries are ignored on access.
-
-2. **Physically**
-   `gc()` removes expired entries from memory.
-
-There are no background timers.
-
-### What does `gc()` do?
-
-Only this:
-
-- Deletes expired entries
-- Frees memory
-
-It does not refresh TTL, evict valid entries, touch in-flight calls, or affect stats.
-
-### What happens on errors?
-
-- Errors are not cached
-- All concurrent callers receive the same error
-- `onError` is called once
-- Existing entries for the key are invalidated
-- The cache remains usable
-
-### Is `ttl: Infinity` allowed?
-
-Yes.
-
-- Entries never expire
-- GC will not remove them
-- Invalidation must be explicit
+- value never expires
+- entry remains until process restart
 
 Use only with bounded key space.
 
-### Why does the API use `createCache()`?
+## In-Flight Deduplication
 
-`createCache()` is used so the cache itself is directly callable.
-This keeps the common case (`cache(key).call(...)`) simple and avoids extra method indirection.
+Concurrent calls with the same key share the same Promise.
+
+```ts
+const results = await Promise.all([
+  cache(fetchUsers, {
+    key: "users",
+    ttl: 1000,
+  }),
+
+  cache(fetchUsers, {
+    key: "users",
+    ttl: 1000,
+  }),
+
+  cache(fetchUsers, {
+    key: "users",
+    ttl: 1000,
+  }),
+]);
+```
+
+Only one `fetchUsers()` runs.
+
+All callers receive the same result.
+
+## Error Semantics
+
+Errors are never cached.
+
+```ts
+await cache(
+  async () => {
+    throw new Error("boom");
+  },
+  {
+    key: "users",
+    ttl: 1000,
+  },
+);
+```
+
+Behavior:
+
+- all concurrent waiters receive the same error
+- no cache entry is stored
+- next call retries normally
+- in-flight state is cleaned automatically
+
+## Cache Keys
+
+The cache operates strictly by key.
+
+```ts
+key: "users";
+```
+
+The library does not normalize arguments or inspect function input.
+
+If argument-sensitive caching is needed, include it in the key:
+
+```ts
+key: `user:${id}`;
+```
+
+## Design Constraints
+
+This cache intentionally does not provide:
+
+- distributed storage
+- LRU eviction
+- background GC
+- sliding TTL
+- metrics/stats
+- persistence
+- serialization
+- deep argument comparison
+
+The contract is intentionally small and explicit.
+
+## Example
+
+```ts
+import { cache } from "@papack/cache";
+
+export async function getUser(id: string) {
+  return cache(
+    async () => {
+      const res = await fetch(`https://api.example.com/users/${id}`);
+
+      if (!res.ok) {
+        throw new Error("failed");
+      }
+
+      return res.json();
+    },
+    {
+      key: `user:${id}`,
+      ttl: 30_000,
+    },
+  );
+}
+```
